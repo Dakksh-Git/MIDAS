@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Project outputs and artifacts
+outputs/
+checkpoints/
+
+# Large/raw datasets
+Data/Raw/
+Data/processed/
+Data/splits/
+BraTS2020_TrainingData/
+BraTS2020_ValidationData/
+Inflammatory dataset/
+Scar dataset/
+remind/
+metadata/
+
+# Large medical files
+*.nii
+*.nii.gz
+*.dcm
+*.mat
+*.pth
