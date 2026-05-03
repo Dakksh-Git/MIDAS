@@ -613,7 +613,7 @@ def process_lumiere() -> Tuple[List[dict], Counter, List[str], dict]:
     print("PART 4 - Lumiere scar preprocessing")
     print("=" * 80)
 
-    imaging_root = PROJECT_ROOT / "Scar dataset" / "Imaging"
+    imaging_root = PROJECT_ROOT / "Data" / "Raw" / "Scar"
     output_dir = OUTPUT_DIR / "lumiere"
 
     if not imaging_root.exists():
@@ -680,7 +680,7 @@ def process_ms() -> Tuple[List[dict], Counter, List[str], dict]:
     print("PART 5 - MS inflammatory preprocessing")
     print("=" * 80)
 
-    ms_root = PROJECT_ROOT / "Inflammatory dataset"
+    ms_root = PROJECT_ROOT / "Data" / "Raw" / "Inflammatory"
     output_dir = OUTPUT_DIR / "ms"
 
     if not ms_root.exists():
