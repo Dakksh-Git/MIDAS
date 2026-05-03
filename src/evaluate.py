@@ -26,7 +26,7 @@ from src.model import get_model
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TEST_CSV = PROJECT_ROOT / "Data" / "splits" / "test.csv"
-CHECKPOINT = PROJECT_ROOT / "checkpoints" / "best_model.pth"
+CHECKPOINT = PROJECT_ROOT / "checkpoints" / "best_model_v5_final.pth"
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
 CLASS_NAMES = {0: "Malignant", 1: "Benign", 2: "Normal", 3: "Scar", 4: "Inflammatory"}
 NUM_CLASSES = 5

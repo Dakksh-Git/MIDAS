@@ -1,6 +1,6 @@
 # MIDAS — Multi-modal Intelligent Diagnostic and Analysis System
 
-> A 4-branch 3D deep learning system for brain MRI classification across 5 neurological conditions, trained on 1,700+ patient scans with 92.3% test accuracy and 99.1% macro AUC-ROC.
+> A 4-branch 3D deep learning system for brain MRI classification across 5 neurological conditions, trained on 1,700+ patient scans with 92.11% test accuracy and 98.94% macro AUC-ROC.
 
 ---
 
@@ -31,12 +31,12 @@ FLAIR──► ResNet-18 Branch ──┘
 
 | Metric | Score |
 |--------|-------|
-| Test Accuracy | **92.3%** |
-| Macro AUC-ROC | **99.1%** |
+| Test Accuracy | **92.11%** |
+| Macro AUC-ROC | **98.94%** |
 | Parameters | ~33.7M |
-| Test Set Size | 256 scans |
+| Test Set Size | 317 scans |
 
-Training split: **1192 train / 255 val / 256 test** across a 1,700+ patient hybrid dataset.
+Training split: **1192 train / 255 val / 317 test** across a 1,700+ patient hybrid dataset.
 
 ---
 
