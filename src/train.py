@@ -30,7 +30,7 @@ SPLITS_DIR = PROJECT_ROOT / "Data" / "splits"
 CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
 LOG_DIR = PROJECT_ROOT / "outputs" / "logs"
 
-BATCH_SIZE = 2
+BATCH_SIZE = 8
 NUM_EPOCHS = 50
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
@@ -152,16 +152,20 @@ def create_dataloaders() -> tuple[DataLoader, DataLoader]:
         train_dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=2,
+        num_workers=6,
         pin_memory=pin_memory,
+        persistent_workers=True,
+        prefetch_factor=2,
         drop_last=True,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=2,
+        num_workers=4,
         pin_memory=pin_memory,
+        persistent_workers=True,
+        prefetch_factor=2,
         drop_last=True,
     )
     return train_loader, val_loader
@@ -229,12 +233,14 @@ def train_one_epoch(
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    scaler: "torch.amp.GradScaler | None" = None,
 ) -> tuple[float, float]:
     """Run one training epoch."""
     model.train()
     running_loss = 0.0
     correct = 0
     total = 0
+    use_amp = scaler is not None and device.type == "cuda"
 
     progress = tqdm(loader, desc="Training", leave=False)
     for inputs, labels in progress:
@@ -251,11 +257,20 @@ def train_one_epoch(
         labels = labels.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        outputs = model(inputs)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
 
         batch_size = labels.size(0)
         running_loss += loss.item() * batch_size
@@ -299,8 +314,9 @@ def validate_one_epoch(
             inputs = inputs.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
+            with torch.amp.autocast(device_type="cuda", enabled=(device.type == "cuda")):
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
 
             batch_size = labels.size(0)
             running_loss += loss.item() * batch_size
@@ -345,6 +361,7 @@ def train_model(fresh: bool = False) -> dict[str, Any]:
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
     criterion = nn.CrossEntropyLoss(weight=class_weights)
+    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
     history_path = LOG_DIR / "training_history.json"
     checkpoint_path = CHECKPOINT_DIR / "last_model.pth"
@@ -390,8 +407,22 @@ def train_model(fresh: bool = False) -> dict[str, Any]:
         last_epoch_completed = max(last_epoch_completed, checkpoint_epoch)
         best_val_loss = min(best_val_loss, float(checkpoint.get("val_loss", best_val_loss)))
 
+        # training_history.json is only flushed when the epoch loop exits cleanly
+        # (see the `finally` block below), so after an interrupted run it can be
+        # stale or missing. best_model.pth is written synchronously every time a
+        # true best is found, so it is the authoritative source of truth for
+        # best_val_loss/best_epoch independent of history.json's freshness.
+        best_checkpoint_path = CHECKPOINT_DIR / "best_model.pth"
+        if best_checkpoint_path.exists():
+            best_checkpoint = torch.load(best_checkpoint_path, map_location=device)
+            best_checkpoint_loss = float(best_checkpoint.get("val_loss", best_val_loss))
+            if best_checkpoint_loss <= best_val_loss:
+                best_val_loss = best_checkpoint_loss
+                best_epoch = int(best_checkpoint.get("epoch", best_epoch))
+
         print(f"Resuming training from checkpoint: {checkpoint_path}")
         print(f"Starting from epoch {start_epoch}/{NUM_EPOCHS}")
+        print(f"True best so far: epoch {best_epoch}, val_loss={best_val_loss:.4f}")
 
         if start_epoch > 1:
             for _ in range(start_epoch - 1):
@@ -401,14 +432,17 @@ def train_model(fresh: bool = False) -> dict[str, Any]:
         print("Training is already complete based on the saved checkpoint.")
         return history
 
-    patience_counter = 0
+    patience_counter = max(0, (start_epoch - 1) - best_epoch) if best_epoch > 0 else 0
+    if patience_counter > 0:
+        print(f"Resuming with patience_counter={patience_counter}/{PATIENCE} "
+              f"(no improvement since epoch {best_epoch}).")
     start_time = time.time()
 
     try:
         for epoch in range(start_epoch, NUM_EPOCHS + 1):
             epoch_start = time.time()
 
-            train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
+            train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device, scaler)
             val_loss, val_acc, per_class_acc = validate_one_epoch(model, val_loader, criterion, device)
 
             scheduler.step()

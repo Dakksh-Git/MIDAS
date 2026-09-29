@@ -321,7 +321,10 @@ def map_remind_label(histopathology: object, grade_value: object) -> Optional[in
     hist_lower = hist.lower()
     grade = parse_grade(grade_value)
 
-    # Histopathology drives mapping. WHO grade is used only for astrocytoma tie-breaking.
+    # Histopathology drives mapping. WHO grade is used for astrocytoma and
+    # oligodendroglioma, since both are graded 1-4 under CNS WHO classification
+    # and grade 3/4 ("anaplastic") is high-grade/malignant, not low-grade/benign --
+    # a fixed histopathology string alone doesn't disambiguate that.
     if not hist_lower:
         return None
 
@@ -353,6 +356,11 @@ def map_remind_label(histopathology: object, grade_value: object) -> Optional[in
         return 0
 
     if hist_lower == "oligodendroglioma":
+        if grade in {"3", "4"}:
+            return 0
+        if grade in {"1", "2"}:
+            return 1
+        # If grade is missing or not assigned, keep a deterministic default.
         return 1
     if hist_lower == "low grade glioma":
         return 1
@@ -378,16 +386,65 @@ def map_remind_label(histopathology: object, grade_value: object) -> Optional[in
     return None
 
 
-def get_primary_series(dcm_files: Sequence[Path]) -> List[Path]:
+def classify_remind_series_role(series_description: str, modality: str) -> Optional[str]:
+    """Classify a ReMIND DICOM series into a T1/T1CE/T2/FLAIR role by SeriesDescription.
+
+    Verified against the actual SeriesDescription values present across all 114
+    ReMIND patients (see project notes). "postcontrast" -> T1CE; "precontrast" and
+    "MP2RAGE" T1 series are genuine non-contrast T1 (must be checked before generic
+    "contrast" substring matching, since "precontrast" contains "contrast").
+    """
+    if modality != "MR":
+        return None
+    desc = (series_description or "").lower()
+    if "postcontrast" in desc:
+        return "T1CE"
+    if "flair" in desc:
+        return "FLAIR"
+    if "t2" in desc:
+        return "T2"
+    if "t1" in desc:
+        return "T1"
+    return None
+
+
+def group_dicom_series(dcm_files: Sequence[Path]) -> Dict[Path, List[Path]]:
     grouped: Dict[Path, List[Path]] = defaultdict(list)
     for file_path in dcm_files:
         grouped[file_path.parent].append(file_path)
+    return grouped
 
-    best_series = sorted(
-        grouped.items(),
-        key=lambda item: (-len(item[1]), str(item[0]))
-    )[0][1]
-    return sorted(best_series, key=lambda path: path.name)
+
+def select_remind_series_per_role(patient_dir: Path) -> Dict[str, List[Path]]:
+    """Pick the best (most-slice) real DICOM series per T1/T1CE/T2/FLAIR role.
+
+    A single-largest-series heuristic (the previous approach) silently discarded
+    real, distinct sequences that exist in the ReMIND collection. This instead
+    classifies every series by its DICOM SeriesDescription and keeps the best
+    candidate for each of the four clinical roles independently, only falling
+    back to duplication for roles with no real series available for that patient.
+    """
+    dcm_files = sorted(patient_dir.rglob("*.dcm"), key=lambda path: path.name)
+    grouped = group_dicom_series(dcm_files)
+
+    best_per_role: Dict[str, Tuple[int, List[Path]]] = {}
+    for series_dir, files in grouped.items():
+        if len(files) < 5:
+            continue  # skip localizers / single-frame reference series
+        try:
+            ds = pydicom.dcmread(str(files[0]), stop_before_pixels=True)
+        except Exception:
+            continue
+        role = classify_remind_series_role(
+            getattr(ds, "SeriesDescription", ""), getattr(ds, "Modality", "")
+        )
+        if role is None:
+            continue
+        ordered_files = sorted(files, key=lambda path: path.name)
+        if role not in best_per_role or len(ordered_files) > best_per_role[role][0]:
+            best_per_role[role] = (len(ordered_files), ordered_files)
+
+    return {role: files for role, (_, files) in best_per_role.items()}
 
 
 def process_remind() -> Tuple[List[dict], Counter, List[str], dict]:
@@ -474,40 +531,37 @@ def process_remind() -> Tuple[List[dict], Counter, List[str], dict]:
                     "Reason": "mapped successfully",
                 })
 
-            dcm_files = sorted(patient_dir.rglob("*.dcm"), key=lambda path: path.name)
-            if not dcm_files:
-                skipped.append(f"ReMIND {case_id}: no DICOM files found")
+            role_series = select_remind_series_per_role(patient_dir)
+            if "T2" not in role_series:
+                skipped.append(f"ReMIND {case_id}: no usable T2 series found (required baseline)")
                 stats["failed"] += 1
                 continue
 
-            primary_series_files = get_primary_series(dcm_files)
-            slices = []
-            for dcm_path in primary_series_files:
-                ds = pydicom.dcmread(str(dcm_path))
-                slices.append(np.asarray(ds.pixel_array))
+            def load_and_prepare(files: List[Path]) -> np.ndarray:
+                slices = [np.asarray(pydicom.dcmread(str(f)).pixel_array) for f in files]
+                vol = np.stack(slices, axis=-1)
+                return normalize_volume(resize_volume(vol, TARGET_SHAPE, order=1))
+
+            prepared: Dict[str, np.ndarray] = {}
+            for role, files in role_series.items():
+                prepared[role] = load_and_prepare(files)
+
+            # Real-role fallback priority (verified against all 114 ReMIND patients):
+            # T2 is always present; FLAIR falls back to T2; T1CE falls back to real T1
+            # then T2; T1 falls back to real T1CE then T2. Genuine roles are used
+            # wherever the DICOM data actually provides them (most patients provide
+            # T1CE + T2 + FLAIR for real; only the rarest cases fall back to T2 alone).
+            t2 = prepared["T2"]
+            flair = prepared.get("FLAIR", t2)
+            t1ce = prepared.get("T1CE", prepared.get("T1", t2))
+            t1 = prepared.get("T1", prepared.get("T1CE", t2))
+
+            n_real_channels = len({"T1", "T1CE", "T2", "FLAIR"} & set(prepared.keys()))
+            stacked = np.stack([t1, t1ce, t2, flair], axis=0).astype(np.float32)
 
             if DEBUG_MODE:
-                print(f"[DEBUG][ReMIND] DICOM files in primary series: {len(primary_series_files)}")
-                print(f"[DEBUG][ReMIND] First DICOM: {primary_series_files[0].name}")
-
-            if not slices:
-                skipped.append(f"ReMIND {case_id}: primary series could not be loaded")
-                stats["failed"] += 1
-                continue
-
-            volume = np.stack(slices, axis=-1)
-            if volume.ndim != 3:
-                skipped.append(f"ReMIND {case_id}: unexpected DICOM volume shape {volume.shape}")
-                stats["failed"] += 1
-                continue
-
-            resized = resize_volume(volume, TARGET_SHAPE, order=1)
-            normalized = normalize_volume(resized)
-            stacked = np.stack([normalized] * 4, axis=0).astype(np.float32)
-
-            if DEBUG_MODE:
-                print(f"[DEBUG][ReMIND] Raw volume shape: {volume.shape}")
-                print(f"[DEBUG][ReMIND] Resized volume shape: {resized.shape}")
+                print(f"[DEBUG][ReMIND] Roles found: {sorted(prepared.keys())}")
+                print(f"[DEBUG][ReMIND] Real channel count: {n_real_channels}/4")
                 print(f"[DEBUG][ReMIND] Final stacked sample shape: {stacked.shape}")
                 print(f"[DEBUG][ReMIND] Assigned label: {patient_label}")
 
@@ -515,6 +569,7 @@ def process_remind() -> Tuple[List[dict], Counter, List[str], dict]:
             records.append({"filepath": str(output_path), "label": patient_label, "source": "remind"})
             class_counts[patient_label] += 1
             stats["succeeded"] += 1
+            stats.setdefault("real_channel_histogram", Counter())[n_real_channels] += 1
 
             if DEBUG_MODE:
                 print(f"[DEBUG][ReMIND] Saved sample: {output_path}")
@@ -532,6 +587,12 @@ def process_remind() -> Tuple[List[dict], Counter, List[str], dict]:
             print(debug_df.to_string(index=False))
         else:
             print("  No clinical mapping rows were captured.")
+
+    real_channel_histogram = stats.get("real_channel_histogram")
+    if real_channel_histogram:
+        print("\nReMIND real-channel-count distribution (out of 4 clinical roles):")
+        for n_real in sorted(real_channel_histogram, reverse=True):
+            print(f"  {n_real}/4 genuine channels: {real_channel_histogram[n_real]} patients")
 
     return records, class_counts, skipped, stats
 
